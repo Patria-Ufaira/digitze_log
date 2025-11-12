@@ -10,9 +10,23 @@ st.set_page_config(page_title="Log Digitizer + Table OCR (RapidOCR)", layout="wi
 st.title("🛠️ Well Log Digitizer and Table OCR ")
 
 TAB1, TAB2 = st.tabs(["Digitize Log Curve", "OCR Table → CSV (RapidOCR)"])
-def to_cv(img_pil: Image.Image):
+
+# ===================== Utilities =====================
+def to_cv(img_pil: Image.Image) -> np.ndarray:
+    """PIL -> BGR (OpenCV)."""
     arr = np.array(img_pil.convert("RGB"))
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+def resize_keep(image: Image.Image, max_w=900, max_h=1200):
+    """Resize menjaga rasio, tidak upscale."""
+    w0, h0 = image.size
+    scale = min(max_w / w0, max_h / h0, 1.0)
+    wv, hv = int(w0 * scale), int(h0 * scale)
+    try:
+        resized = image.resize((wv, hv), Image.Resampling.LANCZOS)
+    except Exception:
+        resized = image.resize((wv, hv), Image.LANCZOS)
+    return resized, (w0, h0, wv, hv, scale)
 
 with TAB1:
     st.header("Digitize a Log Curve from Image")
@@ -29,42 +43,48 @@ with TAB1:
         reverse_x = st.checkbox("Reverse x (left > right visually)?", value=True)
         smooth_win = st.slider("Smoothing window (rows)", 1, 25, 5, step=2)
 
-    img_file = st.file_uploader("Upload log image (JPG/PNG)", type=["jpg", "jpeg", "png"], key="digitizer_upl")
+    img_file = st.file_uploader("Upload log image (JPG/PNG)", type=["jpg","jpeg","png"], key="digitizer_upl")
     if img_file is None:
         st.info("Upload an image to begin (Digitizer tab).")
     else:
         image = Image.open(img_file).convert("RGB")
-        W, H = image.size
+        resized, (W0, H0, Wv, Hv, SCALE) = resize_keep(image, max_w=900, max_h=1200)
 
         st.subheader("Draw bounding box on the DT track")
         st.caption("Use the rectangle tool. When done, click outside to finalize.")
 
         canvas_result = st_canvas(
-            fill_color="rgba(0, 0, 0, 0)",
+            fill_color="rgba(0,0,0,0)",
             stroke_width=2,
             stroke_color="#00ff00",
-            background_image=image,
+            background_image=resized,     
             update_streamlit=True,
-            height=min(900, H),
-            width=min(800, W),
+            height=Hv, width=Wv,         
             drawing_mode="rect",
-            key="bbox_canvas_digitizer",
+            key=f"bbox_canvas_{Wv}x{Hv}", 
         )
 
-        bbox = None
+        bbox = None  
         if canvas_result.json_data is not None:
             objs = canvas_result.json_data.get("objects", [])
             rects = [o for o in objs if o.get("type") == "rect"]
             if rects:
                 r = rects[-1]
-                x0 = int(r["left"]); y0 = int(r["top"])
-                x1 = int(r["left"] + r["width"]); y1 = int(r["top"] + r["height"])
-                x0, y0 = max(0, x0), max(0, y0)
-                x1, y1 = min(W, x1), min(H, y1)
-                if x1 > x0 and y1 > y0:
+                # koordinat pada kanvas (resized)
+                x0v = max(0, int(r["left"]))
+                y0v = max(0, int(r["top"]))
+                x1v = min(Wv, int(r["left"] + r["width"]))
+                y1v = min(Hv, int(r["top"] + r["height"]))
+                if x1v > x0v and y1v > y0v:
+                    # konversi ke skala asli
+                    x0 = int(x0v / SCALE); y0 = int(y0v / SCALE)
+                    x1 = int(x1v / SCALE); y1 = int(y1v / SCALE)
+                    x0, y0 = max(0, x0), max(0, y0)
+                    x1, y1 = min(W0, x1), min(H0, y1)
                     bbox = (x0, y0, x1, y1)
 
-        def extract_curve(roi_bgr, dmin, dmax, v_left, v_right, reverse_x=False, median_k=3, blur=3, canny=(50,150)):
+        def extract_curve(roi_bgr, dmin, dmax, v_left, v_right, reverse_x=False,
+                          median_k=3, blur=3, canny=(50,150)):
             gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
             if blur and blur % 2 == 1:
                 gray = cv2.GaussianBlur(gray, (blur, blur), 0)
@@ -81,7 +101,6 @@ with TAB1:
                     edge_intens = gray[row, edge_cols]
                     idx = np.argsort(edge_intens)[:max(1, median_k)]
                     sel = edge_cols[idx]
-
                 x_est = int(np.median(sel))
                 frac_x = x_est / max(1, w - 1)
                 vL, vR = (v_right, v_left) if reverse_x else (v_left, v_right)
@@ -100,11 +119,11 @@ with TAB1:
         with col1:
             st.markdown("### Selected ROI")
             if bbox:
-                st.code(f"bbox = {bbox}", language="text")
+                st.code(f"bbox (orig) = {bbox}", language="text")
                 roi = to_cv(image)[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-                st.image(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB), caption="ROI (track)")
+                st.image(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB), caption="ROI (original scale)")
             else:
-                st.warning("Draw a rectangle to define the ROI (bounding box).")
+                st.warning("Draw a rectangle to define the ROI.")
 
         with col2:
             st.markdown("### Extract")
@@ -115,12 +134,12 @@ with TAB1:
                     roi = to_cv(image)[bbox[1]:bbox[3], bbox[0]:bbox[2]]
                     df = extract_curve(
                         roi, depth_min, depth_max, log_left, log_right,
-                        reverse_x=reverse_x, median_k=median_k, blur=blur, canny=(canny_low, canny_high)
+                        reverse_x=reverse_x, median_k=median_k, blur=blur,
+                        canny=(canny_low, canny_high),
                     )
                     st.success(f"Extracted {len(df)} samples.")
                     st.line_chart(df[["value", "value_smooth"]])
 
-                    # Overlay preview
                     import matplotlib
                     matplotlib.use("Agg")
                     import matplotlib.pyplot as plt
