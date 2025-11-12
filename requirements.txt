@@ -5,3 +5,5 @@ numpy
 pandas
 Pillow
 matplotlib
+paddlepaddle==3.2.1
+paddleocr==2.7.3
